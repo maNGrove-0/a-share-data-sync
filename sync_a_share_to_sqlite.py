@@ -260,6 +260,23 @@ def get_last_trade_date(conn: sqlite3.Connection, symbol: str) -> dt.date | None
     return dt.date.fromisoformat(row[0])
 
 
+def compute_fetch_start_date(
+    global_start: dt.date,
+    last_trade_date: dt.date | None,
+    adjust: str,
+    adjust_backfill_days: int,
+) -> dt.date:
+    """计算本次拉取起点；复权模式下回补一段历史以覆盖复权变更。"""
+    if last_trade_date is None:
+        return global_start
+
+    incremental_start = last_trade_date + dt.timedelta(days=1)
+    if adjust and adjust_backfill_days > 0:
+        backfill_start = last_trade_date - dt.timedelta(days=adjust_backfill_days)
+        return max(global_start, min(incremental_start, backfill_start))
+    return max(global_start, incremental_start)
+
+
 def fetch_symbol_daily_ts(
     symbol: str,
     start_date: dt.date,
@@ -387,10 +404,21 @@ def build_cli() -> argparse.ArgumentParser:
     parser.add_argument("--sleep", type=float, default=0.8)
     parser.add_argument("--max-retries", type=int, default=4)
     parser.add_argument("--retry-backoff", type=float, default=1.0)
+    parser.add_argument(
+        "--adjust-backfill-days",
+        type=int,
+        default=365,
+        help="复权模式(qfq/hfq)下每次回补的历史天数，用于刷新复权变更",
+    )
     parser.add_argument("--symbols", default="", help="e.g. 000001,600519")
     parser.add_argument("--symbols-file", default="", help="comma/newline separated")
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--refresh-symbols", action="store_true", help="refresh symbol pool from Tushare")
+    parser.add_argument(
+        "--skip-symbol-refresh",
+        action="store_true",
+        help="仅使用本地 symbols/daily_quotes 缓存，不请求 Tushare 股票池",
+    )
+    parser.add_argument("--refresh-symbols", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--ts-token", default="", help="Priority: cli > env > file")
     parser.add_argument(
         "--ts-token-file",
@@ -404,6 +432,9 @@ def main() -> int:
     """执行主流程：初始化 -> 获取股票池 -> 增量同步 -> 输出结果。"""
     args = build_cli().parse_args()
     require_dependencies()
+    if getattr(args, "refresh_symbols", False):
+        # 兼容旧参数：显式刷新优先于“仅用本地缓存”。
+        args.skip_symbol_refresh = False
 
     start_date = parse_date(args.start_date)
     end_date = parse_date(args.end_date)
@@ -422,7 +453,11 @@ def main() -> int:
         symbol_pairs = [(s, "") for s in manual_symbols]
     else:
         local_pairs = get_symbol_pool_from_local_cache(conn)
-        if local_pairs and not args.refresh_symbols:
+        if args.skip_symbol_refresh:
+            if not local_pairs:
+                raise RuntimeError(
+                    "指定了 --skip-symbol-refresh，但本地无股票池缓存。"
+                )
             symbol_pairs = local_pairs
             print(f"Using local symbol cache: {len(symbol_pairs)}")
         else:
@@ -450,6 +485,8 @@ def main() -> int:
     print(f"Symbols to sync: {total_symbols}")
     print(f"Date range: {start_date} -> {end_date}")
     print(f"Adjust: {args.adjust or '(none)'}")
+    if args.adjust:
+        print(f"Adjust backfill days: {args.adjust_backfill_days}")
 
     inserted_total = 0
     skipped = 0
@@ -457,7 +494,12 @@ def main() -> int:
 
     for idx, (symbol, _) in enumerate(symbol_pairs, start=1):
         last_dt = get_last_trade_date(conn, symbol)
-        local_start = start_date if last_dt is None else max(start_date, last_dt + dt.timedelta(days=1))
+        local_start = compute_fetch_start_date(
+            global_start=start_date,
+            last_trade_date=last_dt,
+            adjust=args.adjust,
+            adjust_backfill_days=args.adjust_backfill_days,
+        )
 
         if local_start > end_date:
             skipped += 1
