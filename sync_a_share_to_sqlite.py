@@ -3,6 +3,7 @@
 用 Tushare 将 A 股日线增量同步到本地 SQLite。
 
 优先级：--ts-token > 环境变量 TS_TOKEN > --ts-token-file（默认 data/ts_token.txt）
+默认策略：每天纯增量；到每周指定日自动触发一次全量回补。
 """
 
 from __future__ import annotations
@@ -407,8 +408,25 @@ def build_cli() -> argparse.ArgumentParser:
     parser.add_argument(
         "--adjust-backfill-days",
         type=int,
-        default=365,
-        help="复权模式(qfq/hfq)下每次回补的历史天数，用于刷新复权变更",
+        default=0,
+        help="日常增量运行时，复权模式(qfq/hfq)的回补天数（默认 0=纯增量）",
+    )
+    parser.add_argument(
+        "--weekly-full-weekday",
+        type=int,
+        default=6,
+        help="每周全量回补触发日：0=周一 ... 6=周日",
+    )
+    parser.add_argument(
+        "--weekly-full-backfill-days",
+        type=int,
+        default=99999,
+        help="每周全量回补时使用的回补天数（足够大即可近似全量）",
+    )
+    parser.add_argument(
+        "--disable-weekly-full",
+        action="store_true",
+        help="关闭每周自动全量回补，仅按 --adjust-backfill-days 执行",
     )
     parser.add_argument("--symbols", default="", help="e.g. 000001,600519")
     parser.add_argument("--symbols-file", default="", help="comma/newline separated")
@@ -440,6 +458,16 @@ def main() -> int:
     end_date = parse_date(args.end_date)
     if start_date > end_date:
         raise ValueError("start-date must be <= end-date")
+    if not (0 <= args.weekly_full_weekday <= 6):
+        raise ValueError("weekly-full-weekday must be in [0, 6]")
+
+    today = dt.date.today()
+    is_weekly_full_day = (
+        (not args.disable_weekly_full) and (today.weekday() == args.weekly_full_weekday)
+    )
+    effective_backfill_days = (
+        args.weekly_full_backfill_days if is_weekly_full_day else args.adjust_backfill_days
+    )
 
     db_path = Path(args.db).expanduser().resolve()
     conn = create_connection(db_path)
@@ -486,7 +514,16 @@ def main() -> int:
     print(f"Date range: {start_date} -> {end_date}")
     print(f"Adjust: {args.adjust or '(none)'}")
     if args.adjust:
-        print(f"Adjust backfill days: {args.adjust_backfill_days}")
+        if is_weekly_full_day:
+            print(
+                "Mode: weekly full refresh "
+                f"(weekday={today.weekday()}, backfill_days={effective_backfill_days})"
+            )
+        else:
+            print(
+                "Mode: daily incremental "
+                f"(weekday={today.weekday()}, backfill_days={effective_backfill_days})"
+            )
 
     inserted_total = 0
     skipped = 0
@@ -498,7 +535,7 @@ def main() -> int:
             global_start=start_date,
             last_trade_date=last_dt,
             adjust=args.adjust,
-            adjust_backfill_days=args.adjust_backfill_days,
+            adjust_backfill_days=effective_backfill_days,
         )
 
         if local_start > end_date:
