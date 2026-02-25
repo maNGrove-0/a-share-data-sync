@@ -135,6 +135,9 @@ def to_ts_symbol(symbol: str) -> str:
     code = normalize_symbol(s)
     if len(code) != 6:
         raise ValueError(f"invalid stock code for Tushare: {symbol}")
+    # 北交所 92xxxx 需要优先判定为 BJ，避免被 9 前缀误判为 SH。
+    if code.startswith("92"):
+        return f"{code}.BJ"
     if code.startswith(("5", "6", "9")):
         return f"{code}.SH"
     if code.startswith(("4", "8")):
@@ -380,15 +383,26 @@ def upsert_daily_quotes(conn: sqlite3.Connection, data) -> int:
 def resolve_ts_token(args: argparse.Namespace) -> tuple[str, Path]:
     """按优先级解析 token：CLI > 环境变量 > 文件。"""
     token_file = Path(args.ts_token_file).expanduser().resolve()
-    file_token = read_secret_first_line(token_file)
-    token = args.ts_token or os.getenv("TS_TOKEN", "") or file_token
-    if not token:
-        raise RuntimeError(
-            "需要 Tushare token。可通过 --ts-token、TS_TOKEN 或 token 文件提供。"
-        )
-    if not args.ts_token and not os.getenv("TS_TOKEN", "") and file_token:
+    cli_token = (args.ts_token or "").strip()
+    if cli_token:
+        return cli_token, token_file
+
+    env_token = (os.getenv("TS_TOKEN", "") or "").strip()
+    if env_token:
+        return env_token, token_file
+
+    try:
+        file_token = read_secret_first_line(token_file).strip()
+    except Exception as exc:
+        raise RuntimeError(f"读取 token 文件失败: {token_file}: {exc}") from exc
+
+    if file_token:
         print(f"Tushare token loaded from file: {token_file}")
-    return token, token_file
+        return file_token, token_file
+
+    raise RuntimeError(
+        "需要 Tushare token。可通过 --ts-token、TS_TOKEN 或 token 文件提供。"
+    )
 
 
 def build_cli() -> argparse.ArgumentParser:
