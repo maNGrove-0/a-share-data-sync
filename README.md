@@ -23,7 +23,7 @@
 字段：
 - `symbol`：6 位股票代码，主键。
 - `name`：股票名称。
-- `updated_at`：记录更新时间。
+- `updated_at`：该条基础信息最近更新时间。
 
 ### `daily_quotes`
 用途：日线行情主表。
@@ -32,9 +32,20 @@
 - `(symbol, trade_date)`。
 
 字段：
-- 价格量：`open/high/low/close/volume/amount`。
-- 衍生字段：`amplitude/pct_chg/chg/turnover`。
-- 元信息：`source/updated_at`。
+- `symbol`：股票代码（6 位），如 `000001`。
+- `trade_date`：交易日期（`YYYY-MM-DD`）。
+- `open`：开盘价。
+- `high`：最高价。
+- `low`：最低价。
+- `close`：收盘价。
+- `volume`：成交量（来自 Tushare `vol`）。
+- `amount`：成交额（来自 Tushare `amount`）。
+- `amplitude`：振幅（百分比），计算方式约为 `(high - low) / pre_close * 100`。
+- `pct_chg`：涨跌幅（百分比）。
+- `chg`：涨跌额。
+- `turnover`：换手率（当前脚本未填，默认 `NULL`）。
+- `source`：数据来源（当前固定为 `tushare`）。
+- `updated_at`：该行最近一次写入/更新时间。
 
 ## 3. 当前同步策略（已实现）
 默认策略是“每天增量 + 每周自动全量回补”。
