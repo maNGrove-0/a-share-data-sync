@@ -52,7 +52,8 @@ CREATE INDEX IF NOT EXISTS idx_daily_quotes_trade_date ON daily_quotes (trade_da
 """
 
 # 固定配置（统一在这里管理，不通过 CLI 暴露）。
-TOKEN_FILE_PATH = Path("data/ts_token.txt")
+PROJECT_ROOT = Path(__file__).resolve().parent
+TOKEN_FILE_PATH = PROJECT_ROOT / "data/ts_token.txt"
 REQUEST_SLEEP_SECONDS = 0.8
 REQUEST_MAX_RETRIES = 4
 REQUEST_RETRY_BACKOFF_SECONDS = 1.0
