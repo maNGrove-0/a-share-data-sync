@@ -72,13 +72,14 @@ A 股日线主表，主键为 `(symbol, trade_date)`。
 
 说明：
 - 以上策略为脚本内固定配置，不通过 CLI 参数暴露。
-- 如需调整，请修改 `sync_a_share_to_sqlite.py` 顶部常量：`ENABLE_WEEKLY_FULL`、`DAILY_ADJUST_BACKFILL_DAYS`、`WEEKLY_FULL_WEEKDAY`、`WEEKLY_FULL_BACKFILL_DAYS`。
+- 如需调整，请修改 `sync_a_share_to_sqlite.py` 顶部常量区（统一管理）：
+  `TOKEN_FILE_PATH`、`REQUEST_SLEEP_SECONDS`、`REQUEST_MAX_RETRIES`、`REQUEST_RETRY_BACKOFF_SECONDS`、`ENABLE_WEEKLY_FULL`、`DAILY_ADJUST_BACKFILL_DAYS`、`WEEKLY_FULL_WEEKDAY`、`WEEKLY_FULL_BACKFILL_DAYS`。
 
 ## Token Resolution
 Token 读取优先级：
 1. `--ts-token`
 2. `TS_TOKEN` 环境变量
-3. `--ts-token-file`（默认 `data/ts_token.txt`）
+3. 脚本固定 token 文件路径 `data/ts_token.txt`
 
 说明：
 - 仅在前两者都不存在时读取 token 文件。
@@ -120,12 +121,9 @@ python /Users/zhao/Quant/股票数据/sync_a_share_to_sqlite.py \
 - `--db`：SQLite 文件路径。
 - `--start-date` / `--end-date`：同步区间。
 - `--adjust {,qfq,hfq}`：复权模式，默认 `qfq`。
-- `--sleep`：每只股票请求间隔（秒）。
-- `--max-retries`：单股票失败重试次数。
-- `--retry-backoff`：重试退避基数（秒）。
 - `--symbols` / `--symbols-file`：手动指定股票池。
 - `--skip-symbol-refresh`：只用本地股票池缓存。
-- `--ts-token` / `--ts-token-file`：Tushare token 配置。
+- `--ts-token`：临时覆盖 Tushare token。
 
 ## Log Format
 示例：

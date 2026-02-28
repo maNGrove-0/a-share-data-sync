@@ -2,7 +2,7 @@
 """
 用 Tushare 将 A 股日线增量同步到本地 SQLite。
 
-优先级：--ts-token > 环境变量 TS_TOKEN > --ts-token-file（默认 data/ts_token.txt）
+优先级：--ts-token > 环境变量 TS_TOKEN > 脚本固定文件（默认 data/ts_token.txt）
 默认策略：每天纯增量；到每周指定日自动触发一次全量回补。
 """
 
@@ -51,7 +51,12 @@ CREATE TABLE IF NOT EXISTS daily_quotes (
 CREATE INDEX IF NOT EXISTS idx_daily_quotes_trade_date ON daily_quotes (trade_date);
 """
 
-# 同步策略固定配置（不通过 CLI 暴露，避免日常命令过于复杂）。
+# 固定配置（统一在这里管理，不通过 CLI 暴露）。
+TOKEN_FILE_PATH = Path("data/ts_token.txt")
+REQUEST_SLEEP_SECONDS = 0.8
+REQUEST_MAX_RETRIES = 4
+REQUEST_RETRY_BACKOFF_SECONDS = 1.0
+
 ENABLE_WEEKLY_FULL = True
 DAILY_ADJUST_BACKFILL_DAYS = 0
 WEEKLY_FULL_WEEKDAY = 6
@@ -386,10 +391,10 @@ def upsert_daily_quotes(conn: sqlite3.Connection, data) -> int:
     return len(tuples)
 
 
-def resolve_ts_token(args: argparse.Namespace) -> tuple[str, Path]:
-    """按优先级解析 token：CLI > 环境变量 > 文件。"""
-    token_file = Path(args.ts_token_file).expanduser().resolve()
-    cli_token = (args.ts_token or "").strip()
+def resolve_ts_token(cli_token: str) -> tuple[str, Path]:
+    """按优先级解析 token：CLI > 环境变量 > 固定文件。"""
+    token_file = TOKEN_FILE_PATH.expanduser().resolve()
+    cli_token = (cli_token or "").strip()
     if cli_token:
         return cli_token, token_file
 
@@ -412,7 +417,13 @@ def resolve_ts_token(args: argparse.Namespace) -> tuple[str, Path]:
 
 
 def validate_sync_policy() -> None:
-    """校验脚本内同步策略常量，避免误配置导致异常行为。"""
+    """校验脚本内常量配置，避免误配置导致异常行为。"""
+    if REQUEST_SLEEP_SECONDS < 0:
+        raise ValueError("REQUEST_SLEEP_SECONDS must be >= 0")
+    if REQUEST_MAX_RETRIES < 1:
+        raise ValueError("REQUEST_MAX_RETRIES must be >= 1")
+    if REQUEST_RETRY_BACKOFF_SECONDS < 0:
+        raise ValueError("REQUEST_RETRY_BACKOFF_SECONDS must be >= 0")
     if DAILY_ADJUST_BACKFILL_DAYS < 0:
         raise ValueError("DAILY_ADJUST_BACKFILL_DAYS must be >= 0")
     if WEEKLY_FULL_BACKFILL_DAYS < 0:
@@ -432,9 +443,6 @@ def build_cli() -> argparse.ArgumentParser:
         help="YYYYMMDD or YYYY-MM-DD",
     )
     parser.add_argument("--adjust", default="qfq", choices=["", "qfq", "hfq"])
-    parser.add_argument("--sleep", type=float, default=0.8)
-    parser.add_argument("--max-retries", type=int, default=4)
-    parser.add_argument("--retry-backoff", type=float, default=1.0)
     parser.add_argument("--symbols", default="", help="e.g. 000001,600519")
     parser.add_argument("--symbols-file", default="", help="comma/newline separated")
     parser.add_argument("--limit", type=int, default=0)
@@ -443,13 +451,7 @@ def build_cli() -> argparse.ArgumentParser:
         action="store_true",
         help="仅使用本地 symbols/daily_quotes 缓存，不请求 Tushare 股票池",
     )
-    parser.add_argument("--refresh-symbols", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--ts-token", default="", help="Priority: cli > env > file")
-    parser.add_argument(
-        "--ts-token-file",
-        default="data/ts_token.txt",
-        help="read first non-empty non-comment line",
-    )
+    parser.add_argument("--ts-token", default="", help="Priority: cli > env > fixed file")
     return parser
 
 
@@ -457,9 +459,6 @@ def main() -> int:
     """执行主流程：初始化 -> 获取股票池 -> 增量同步 -> 输出结果。"""
     args = build_cli().parse_args()
     require_dependencies()
-    if getattr(args, "refresh_symbols", False):
-        # 兼容旧参数：显式刷新优先于“仅用本地缓存”。
-        args.skip_symbol_refresh = False
 
     start_date = parse_date(args.start_date)
     end_date = parse_date(args.end_date)
@@ -476,7 +475,7 @@ def main() -> int:
     db_path = Path(args.db).expanduser().resolve()
     conn = create_connection(db_path)
 
-    token, _ = resolve_ts_token(args)
+    token, _ = resolve_ts_token(args.ts_token)
     pro = ts_auth(token)
     print("Tushare auth success.")
 
@@ -553,8 +552,8 @@ def main() -> int:
                 start_date=local_start,
                 end_date=end_date,
                 adjust=args.adjust,
-                max_retries=args.max_retries,
-                retry_backoff=args.retry_backoff,
+                max_retries=REQUEST_MAX_RETRIES,
+                retry_backoff=REQUEST_RETRY_BACKOFF_SECONDS,
                 pro=pro,
             )
             norm_df = normalize_daily_df_ts(raw_df, symbol=symbol)
@@ -565,8 +564,8 @@ def main() -> int:
             failed += 1
             print(f"[{idx}/{total_symbols}] {symbol}: FAILED: {exc}", file=sys.stderr)
 
-        if args.sleep > 0:
-            time.sleep(args.sleep)
+        if REQUEST_SLEEP_SECONDS > 0:
+            time.sleep(REQUEST_SLEEP_SECONDS)
 
     print(
         f"Done. inserted_rows={inserted_total}, skipped={skipped}, failed={failed}, symbols={total_symbols}"
