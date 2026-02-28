@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS daily_quotes (
 CREATE INDEX IF NOT EXISTS idx_daily_quotes_trade_date ON daily_quotes (trade_date);
 """
 
+# 同步策略固定配置（不通过 CLI 暴露，避免日常命令过于复杂）。
+ENABLE_WEEKLY_FULL = True
+DAILY_ADJUST_BACKFILL_DAYS = 0
+WEEKLY_FULL_WEEKDAY = 6
+WEEKLY_FULL_BACKFILL_DAYS = 99999
+
 
 def parse_date(value: str) -> dt.date:
     """解析日期字符串，支持 `YYYYMMDD` 和 `YYYY-MM-DD`。"""
@@ -405,6 +411,16 @@ def resolve_ts_token(args: argparse.Namespace) -> tuple[str, Path]:
     )
 
 
+def validate_sync_policy() -> None:
+    """校验脚本内同步策略常量，避免误配置导致异常行为。"""
+    if DAILY_ADJUST_BACKFILL_DAYS < 0:
+        raise ValueError("DAILY_ADJUST_BACKFILL_DAYS must be >= 0")
+    if WEEKLY_FULL_BACKFILL_DAYS < 0:
+        raise ValueError("WEEKLY_FULL_BACKFILL_DAYS must be >= 0")
+    if not (0 <= WEEKLY_FULL_WEEKDAY <= 6):
+        raise ValueError("WEEKLY_FULL_WEEKDAY must be in [0, 6]")
+
+
 def build_cli() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(description="Sync A-share daily data from Tushare.")
@@ -419,29 +435,6 @@ def build_cli() -> argparse.ArgumentParser:
     parser.add_argument("--sleep", type=float, default=0.8)
     parser.add_argument("--max-retries", type=int, default=4)
     parser.add_argument("--retry-backoff", type=float, default=1.0)
-    parser.add_argument(
-        "--adjust-backfill-days",
-        type=int,
-        default=0,
-        help="日常增量运行时，复权模式(qfq/hfq)的回补天数（默认 0=纯增量）",
-    )
-    parser.add_argument(
-        "--weekly-full-weekday",
-        type=int,
-        default=6,
-        help="每周全量回补触发日：0=周一 ... 6=周日",
-    )
-    parser.add_argument(
-        "--weekly-full-backfill-days",
-        type=int,
-        default=99999,
-        help="每周全量回补时使用的回补天数（足够大即可近似全量）",
-    )
-    parser.add_argument(
-        "--disable-weekly-full",
-        action="store_true",
-        help="关闭每周自动全量回补，仅按 --adjust-backfill-days 执行",
-    )
     parser.add_argument("--symbols", default="", help="e.g. 000001,600519")
     parser.add_argument("--symbols-file", default="", help="comma/newline separated")
     parser.add_argument("--limit", type=int, default=0)
@@ -472,15 +465,12 @@ def main() -> int:
     end_date = parse_date(args.end_date)
     if start_date > end_date:
         raise ValueError("start-date must be <= end-date")
-    if not (0 <= args.weekly_full_weekday <= 6):
-        raise ValueError("weekly-full-weekday must be in [0, 6]")
+    validate_sync_policy()
 
     today = dt.date.today()
-    is_weekly_full_day = (
-        (not args.disable_weekly_full) and (today.weekday() == args.weekly_full_weekday)
-    )
+    is_weekly_full_day = ENABLE_WEEKLY_FULL and (today.weekday() == WEEKLY_FULL_WEEKDAY)
     effective_backfill_days = (
-        args.weekly_full_backfill_days if is_weekly_full_day else args.adjust_backfill_days
+        WEEKLY_FULL_BACKFILL_DAYS if is_weekly_full_day else DAILY_ADJUST_BACKFILL_DAYS
     )
 
     db_path = Path(args.db).expanduser().resolve()
