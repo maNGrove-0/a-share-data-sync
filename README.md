@@ -65,7 +65,7 @@ A 股日线主表，主键为 `(symbol, trade_date)`。
    日常运行按增量更新，默认日常回补天数为 `0`（纯增量）。
 
 2. Weekly full refresh  
-   每周触发一次近似全量回补（默认周日，回补天数 `99999`）。
+   到每周触发日（默认周日）时，CLI 询问是否执行近似全量回补；确认后使用回补天数 `99999`。
 
 3. Symbol universe refresh  
    默认先从 Tushare 刷新股票池，失败时回退本地缓存。
@@ -73,7 +73,8 @@ A 股日线主表，主键为 `(symbol, trade_date)`。
 说明：
 - 以上策略为脚本内固定配置，不通过 CLI 参数暴露。
 - 如需调整，请修改 `sync_a_share_to_sqlite.py` 顶部常量区（统一管理）：
-  `TOKEN_FILE_PATH`、`REQUEST_SLEEP_SECONDS`、`REQUEST_MAX_RETRIES`、`REQUEST_RETRY_BACKOFF_SECONDS`、`ENABLE_WEEKLY_FULL`、`DAILY_ADJUST_BACKFILL_DAYS`、`WEEKLY_FULL_WEEKDAY`、`WEEKLY_FULL_BACKFILL_DAYS`。
+  `TOKEN_FILE_PATH`、`REQUEST_SLEEP_SECONDS`、`REQUEST_MAX_RETRIES`、`REQUEST_RETRY_BACKOFF_SECONDS`、`DAILY_ADJUST_BACKFILL_DAYS`、`WEEKLY_FULL_WEEKDAY`、`WEEKLY_FULL_BACKFILL_DAYS`。
+- 在非交互终端（如定时任务）默认不执行每周全量，按日增量运行。
 
 ## Token Resolution
 Token 读取优先级：
