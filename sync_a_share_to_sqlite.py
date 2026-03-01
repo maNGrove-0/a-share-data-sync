@@ -52,13 +52,20 @@ CREATE INDEX IF NOT EXISTS idx_daily_quotes_trade_date ON daily_quotes (trade_da
 """
 
 # 固定配置（统一在这里管理，不通过 CLI 暴露）。
+# 1) 路径配置：token 文件位置固定为项目内 data/ts_token.txt。
 PROJECT_ROOT = Path(__file__).resolve().parent
 TOKEN_FILE_PATH = PROJECT_ROOT / "data/ts_token.txt"
+
+# 2) 请求配置：控制请求间隔、重试次数、退避基数。
 REQUEST_SLEEP_SECONDS = 0.8
 REQUEST_MAX_RETRIES = 4
 REQUEST_RETRY_BACKOFF_SECONDS = 1.0
 
-ENABLE_WEEKLY_FULL = True
+# 3) 同步策略配置：
+#    - 日常按增量执行（回补天数通常设为 0）。
+#    - 到每周指定日时，在 CLI 中询问是否执行近似全量回补，用于修正复权历史。
+#    - 复权模式固定在脚本内配置，默认 qfq。
+ADJUST_MODE = "qfq"
 DAILY_ADJUST_BACKFILL_DAYS = 0
 WEEKLY_FULL_WEEKDAY = 6
 WEEKLY_FULL_BACKFILL_DAYS = 99999
@@ -425,12 +432,37 @@ def validate_sync_policy() -> None:
         raise ValueError("REQUEST_MAX_RETRIES must be >= 1")
     if REQUEST_RETRY_BACKOFF_SECONDS < 0:
         raise ValueError("REQUEST_RETRY_BACKOFF_SECONDS must be >= 0")
+    if ADJUST_MODE not in {"", "qfq", "hfq"}:
+        raise ValueError("ADJUST_MODE must be one of '', 'qfq', 'hfq'")
     if DAILY_ADJUST_BACKFILL_DAYS < 0:
         raise ValueError("DAILY_ADJUST_BACKFILL_DAYS must be >= 0")
     if WEEKLY_FULL_BACKFILL_DAYS < 0:
         raise ValueError("WEEKLY_FULL_BACKFILL_DAYS must be >= 0")
     if not (0 <= WEEKLY_FULL_WEEKDAY <= 6):
         raise ValueError("WEEKLY_FULL_WEEKDAY must be in [0, 6]")
+
+
+def ask_weekly_full_refresh(today: dt.date) -> bool:
+    """在每周触发日询问是否执行全量回补；默认不执行。"""
+    if today.weekday() != WEEKLY_FULL_WEEKDAY:
+        return False
+
+    prompt = (
+        f"今天是每周全量触发日（weekday={today.weekday()}）。"
+        "是否执行本次全量回补？[y/N]: "
+    )
+
+    if not sys.stdin.isatty():
+        print("检测到非交互终端，默认不执行每周全量回补。")
+        return False
+
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        print("未读取到输入，默认不执行每周全量回补。")
+        return False
+
+    return answer in {"y", "yes", "1", "true", "是"}
 
 
 def build_cli() -> argparse.ArgumentParser:
@@ -443,7 +475,6 @@ def build_cli() -> argparse.ArgumentParser:
         default=dt.date.today().strftime("%Y%m%d"),
         help="YYYYMMDD or YYYY-MM-DD",
     )
-    parser.add_argument("--adjust", default="qfq", choices=["", "qfq", "hfq"])
     parser.add_argument("--symbols", default="", help="e.g. 000001,600519")
     parser.add_argument("--symbols-file", default="", help="comma/newline separated")
     parser.add_argument("--limit", type=int, default=0)
@@ -458,28 +489,35 @@ def build_cli() -> argparse.ArgumentParser:
 
 def main() -> int:
     """执行主流程：初始化 -> 获取股票池 -> 增量同步 -> 输出结果。"""
+    # 步骤 1：解析参数并加载依赖。
     args = build_cli().parse_args()
     require_dependencies()
 
+    # 步骤 2：解析时间区间并校验固定配置。
     start_date = parse_date(args.start_date)
     end_date = parse_date(args.end_date)
     if start_date > end_date:
         raise ValueError("start-date must be <= end-date")
     validate_sync_policy()
 
+    # 步骤 3：计算运行模式（每日增量 / 每周触发日询问全量）。
     today = dt.date.today()
-    is_weekly_full_day = ENABLE_WEEKLY_FULL and (today.weekday() == WEEKLY_FULL_WEEKDAY)
+    # 仅复权模式(qfq/hfq)才需要回补；不复权模式下跳过每周全量询问。
+    is_weekly_full_day = bool(ADJUST_MODE) and ask_weekly_full_refresh(today)
     effective_backfill_days = (
         WEEKLY_FULL_BACKFILL_DAYS if is_weekly_full_day else DAILY_ADJUST_BACKFILL_DAYS
     )
 
+    # 步骤 4：初始化数据库连接与表结构。
     db_path = Path(args.db).expanduser().resolve()
     conn = create_connection(db_path)
 
+    # 步骤 5：解析 token 并完成 Tushare 鉴权。
     token, _ = resolve_ts_token(args.ts_token)
     pro = ts_auth(token)
     print("Tushare auth success.")
 
+    # 步骤 6：确定股票池（手动指定 / 远端刷新 / 本地缓存回退）。
     manual_symbols = parse_symbols_args(args)
     if manual_symbols:
         symbol_pairs = [(s, "") for s in manual_symbols]
@@ -508,6 +546,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
 
+    # 步骤 7：应用数量限制并输出运行摘要。
     if args.limit and args.limit > 0:
         symbol_pairs = symbol_pairs[: args.limit]
 
@@ -516,8 +555,8 @@ def main() -> int:
     print("Source: tushare")
     print(f"Symbols to sync: {total_symbols}")
     print(f"Date range: {start_date} -> {end_date}")
-    print(f"Adjust: {args.adjust or '(none)'}")
-    if args.adjust:
+    print(f"Adjust: {ADJUST_MODE or '(none)'}")
+    if ADJUST_MODE:
         if is_weekly_full_day:
             print(
                 "Mode: weekly full refresh "
@@ -533,26 +572,30 @@ def main() -> int:
     skipped = 0
     failed = 0
 
+    # 步骤 8：逐只股票执行“起始日计算 -> 拉取 -> 标准化 -> 入库”。
     for idx, (symbol, _) in enumerate(symbol_pairs, start=1):
+        # 8.1 根据本地最后交易日与回补策略，计算本次拉取起点。
         last_dt = get_last_trade_date(conn, symbol)
         local_start = compute_fetch_start_date(
             global_start=start_date,
             last_trade_date=last_dt,
-            adjust=args.adjust,
+            adjust=ADJUST_MODE,
             adjust_backfill_days=effective_backfill_days,
         )
 
+        # 8.2 若本地已覆盖到目标区间，直接跳过该股票。
         if local_start > end_date:
             skipped += 1
             print(f"[{idx}/{total_symbols}] {symbol}: up-to-date, skip")
             continue
 
         try:
+            # 8.3 拉取并标准化数据，再 UPSERT 入库。
             raw_df = fetch_symbol_daily_ts(
                 symbol=symbol,
                 start_date=local_start,
                 end_date=end_date,
-                adjust=args.adjust,
+                adjust=ADJUST_MODE,
                 max_retries=REQUEST_MAX_RETRIES,
                 retry_backoff=REQUEST_RETRY_BACKOFF_SECONDS,
                 pro=pro,
@@ -568,6 +611,7 @@ def main() -> int:
         if REQUEST_SLEEP_SECONDS > 0:
             time.sleep(REQUEST_SLEEP_SECONDS)
 
+    # 步骤 9：输出汇总并返回进程码。
     print(
         f"Done. inserted_rows={inserted_total}, skipped={skipped}, failed={failed}, symbols={total_symbols}"
     )
