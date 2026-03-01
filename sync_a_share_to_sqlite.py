@@ -64,6 +64,8 @@ REQUEST_RETRY_BACKOFF_SECONDS = 1.0
 # 3) 同步策略配置：
 #    - 日常按增量执行（回补天数通常设为 0）。
 #    - 到每周指定日时，在 CLI 中询问是否执行近似全量回补，用于修正复权历史。
+#    - 复权模式固定在脚本内配置，默认 qfq。
+ADJUST_MODE = "qfq"
 DAILY_ADJUST_BACKFILL_DAYS = 0
 WEEKLY_FULL_WEEKDAY = 6
 WEEKLY_FULL_BACKFILL_DAYS = 99999
@@ -430,6 +432,8 @@ def validate_sync_policy() -> None:
         raise ValueError("REQUEST_MAX_RETRIES must be >= 1")
     if REQUEST_RETRY_BACKOFF_SECONDS < 0:
         raise ValueError("REQUEST_RETRY_BACKOFF_SECONDS must be >= 0")
+    if ADJUST_MODE not in {"", "qfq", "hfq"}:
+        raise ValueError("ADJUST_MODE must be one of '', 'qfq', 'hfq'")
     if DAILY_ADJUST_BACKFILL_DAYS < 0:
         raise ValueError("DAILY_ADJUST_BACKFILL_DAYS must be >= 0")
     if WEEKLY_FULL_BACKFILL_DAYS < 0:
@@ -471,7 +475,6 @@ def build_cli() -> argparse.ArgumentParser:
         default=dt.date.today().strftime("%Y%m%d"),
         help="YYYYMMDD or YYYY-MM-DD",
     )
-    parser.add_argument("--adjust", default="qfq", choices=["", "qfq", "hfq"])
     parser.add_argument("--symbols", default="", help="e.g. 000001,600519")
     parser.add_argument("--symbols-file", default="", help="comma/newline separated")
     parser.add_argument("--limit", type=int, default=0)
@@ -500,7 +503,7 @@ def main() -> int:
     # 步骤 3：计算运行模式（每日增量 / 每周触发日询问全量）。
     today = dt.date.today()
     # 仅复权模式(qfq/hfq)才需要回补；不复权模式下跳过每周全量询问。
-    is_weekly_full_day = bool(args.adjust) and ask_weekly_full_refresh(today)
+    is_weekly_full_day = bool(ADJUST_MODE) and ask_weekly_full_refresh(today)
     effective_backfill_days = (
         WEEKLY_FULL_BACKFILL_DAYS if is_weekly_full_day else DAILY_ADJUST_BACKFILL_DAYS
     )
@@ -552,8 +555,8 @@ def main() -> int:
     print("Source: tushare")
     print(f"Symbols to sync: {total_symbols}")
     print(f"Date range: {start_date} -> {end_date}")
-    print(f"Adjust: {args.adjust or '(none)'}")
-    if args.adjust:
+    print(f"Adjust: {ADJUST_MODE or '(none)'}")
+    if ADJUST_MODE:
         if is_weekly_full_day:
             print(
                 "Mode: weekly full refresh "
@@ -576,7 +579,7 @@ def main() -> int:
         local_start = compute_fetch_start_date(
             global_start=start_date,
             last_trade_date=last_dt,
-            adjust=args.adjust,
+            adjust=ADJUST_MODE,
             adjust_backfill_days=effective_backfill_days,
         )
 
@@ -592,7 +595,7 @@ def main() -> int:
                 symbol=symbol,
                 start_date=local_start,
                 end_date=end_date,
-                adjust=args.adjust,
+                adjust=ADJUST_MODE,
                 max_retries=REQUEST_MAX_RETRIES,
                 retry_backoff=REQUEST_RETRY_BACKOFF_SECONDS,
                 pro=pro,
