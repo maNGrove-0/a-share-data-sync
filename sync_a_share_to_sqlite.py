@@ -499,7 +499,8 @@ def main() -> int:
 
     # 步骤 3：计算运行模式（每日增量 / 每周触发日询问全量）。
     today = dt.date.today()
-    is_weekly_full_day = ask_weekly_full_refresh(today)
+    # 仅复权模式(qfq/hfq)才需要回补；不复权模式下跳过每周全量询问。
+    is_weekly_full_day = bool(args.adjust) and ask_weekly_full_refresh(today)
     effective_backfill_days = (
         WEEKLY_FULL_BACKFILL_DAYS if is_weekly_full_day else DAILY_ADJUST_BACKFILL_DAYS
     )
