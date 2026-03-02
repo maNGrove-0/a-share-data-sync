@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime as dt
 import os
 import random
@@ -17,6 +18,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
+from typing import Callable
 
 pd = None
 ts = None
@@ -487,6 +489,83 @@ def has_potential_trading_day(start_date: dt.date, end_date: dt.date) -> bool:
     return False
 
 
+def get_open_trade_day_ordinals_from_ts(
+    pro,
+    start_date: dt.date,
+    end_date: dt.date,
+) -> list[int]:
+    """从 Tushare trade_cal 拉取开市日并转为有序 ordinal 列表。"""
+    params = {
+        "exchange": "",
+        "start_date": start_date.strftime("%Y%m%d"),
+        "end_date": end_date.strftime("%Y%m%d"),
+        "fields": "cal_date,is_open",
+    }
+    try:
+        df = pro.trade_cal(**params)
+    except TypeError as exc:
+        # 兼容不支持 fields 参数的旧接口。
+        if "unexpected keyword argument 'fields'" not in str(exc):
+            raise
+        params.pop("fields", None)
+        df = pro.trade_cal(**params)
+
+    if df is None or df.empty:
+        return []
+
+    open_days: set[int] = set()
+    for _, row in df.iterrows():
+        is_open_raw = row.get("is_open", 0)
+        try:
+            is_open = int(is_open_raw)
+        except Exception:
+            try:
+                is_open = int(float(str(is_open_raw).strip() or "0"))
+            except Exception:
+                is_open = 0
+        if is_open != 1:
+            continue
+
+        cal_date_raw = str(row.get("cal_date", "")).strip()
+        if not cal_date_raw:
+            continue
+        try:
+            trade_day = parse_date(cal_date_raw)
+        except Exception:
+            continue
+        open_days.add(trade_day.toordinal())
+
+    return sorted(open_days)
+
+
+def build_trading_day_checker(
+    pro,
+    start_date: dt.date,
+    end_date: dt.date,
+) -> tuple[Callable[[dt.date, dt.date], bool], str]:
+    """构建“区间是否存在潜在交易日”检查器。优先 trade_cal，失败回退工作日规则。"""
+    try:
+        open_day_ordinals = get_open_trade_day_ordinals_from_ts(pro, start_date, end_date)
+        print(
+            "Trading-day pre-check source: tushare trade_cal "
+            f"({len(open_day_ordinals)} open days in range)"
+        )
+
+        def has_open_day_via_calendar(range_start: dt.date, range_end: dt.date) -> bool:
+            if range_start > range_end:
+                return False
+            left = bisect.bisect_left(open_day_ordinals, range_start.toordinal())
+            return left < len(open_day_ordinals) and open_day_ordinals[left] <= range_end.toordinal()
+
+        return has_open_day_via_calendar, "trade_cal"
+    except Exception as exc:
+        print(
+            f"Trading-day pre-check: tushare trade_cal unavailable, fallback to weekday rule. error: {exc}",
+            file=sys.stderr,
+        )
+    return has_potential_trading_day, "weekday"
+
+
 def write_failed_symbols(file_path: Path, symbols: list[str]) -> None:
     """将失败股票代码落盘（每行一个 6 位代码）。"""
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -511,6 +590,22 @@ def build_cli() -> argparse.ArgumentParser:
         "--skip-symbol-refresh",
         action="store_true",
         help="仅使用本地 symbols/daily_quotes 缓存，不请求 Tushare 股票池",
+    )
+    parser.add_argument(
+        "--weekly-full",
+        choices=["auto", "yes", "no"],
+        default="auto",
+        help="每周全量模式：auto=触发日交互确认，yes=触发日自动执行，no=永不执行",
+    )
+    parser.add_argument(
+        "--save-failed-file",
+        default="",
+        help="将本次失败股票代码写入文件（去重后每行一个 6 位代码）",
+    )
+    parser.add_argument(
+        "--retry-failed-file",
+        default="",
+        help="从失败列表文件读取股票代码并仅同步这些代码（优先级最高）",
     )
     parser.add_argument("--ts-token", default="", help="Priority: cli > env > fixed file")
     return parser
@@ -545,12 +640,16 @@ def main() -> int:
     token, _ = resolve_ts_token(args.ts_token)
     pro = ts_auth(token)
     print("Tushare auth success.")
+    has_trading_day, trading_day_check_source = build_trading_day_checker(
+        pro=pro,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
-    # 步骤 6：确定股票池（手动指定 / 远端刷新 / 本地缓存回退）。
-    manual_symbols = parse_symbols_args(args)
+    # 步骤 6：确定股票池（失败列表重试 / 手动指定 / 远端刷新 / 本地缓存回退）。
     failed_retry_symbols = []
     if args.retry_failed_file:
-        retry_path = Path(args.retry_failed_file)
+        retry_path = Path(args.retry_failed_file).expanduser().resolve()
         if not retry_path.exists():
             raise FileNotFoundError(f"retry-failed file not found: {retry_path}")
         text = retry_path.read_text(encoding="utf-8")
@@ -563,32 +662,34 @@ def main() -> int:
     if failed_retry_symbols:
         symbol_pairs = [(s, "") for s in failed_retry_symbols]
         print(f"Using retry-failed symbol list: {len(symbol_pairs)}")
-    elif manual_symbols:
-        symbol_pairs = [(s, "") for s in manual_symbols]
     else:
-        local_pairs = get_symbol_pool_from_local_cache(conn)
-        if args.skip_symbol_refresh:
-            if not local_pairs:
-                raise RuntimeError(
-                    "指定了 --skip-symbol-refresh，但本地无股票池缓存。"
-                )
-            symbol_pairs = local_pairs
-            print(f"Using local symbol cache: {len(symbol_pairs)}")
+        manual_symbols = parse_symbols_args(args)
+        if manual_symbols:
+            symbol_pairs = [(s, "") for s in manual_symbols]
         else:
-            try:
-                symbol_pairs = get_symbol_pool_from_ts(pro)
-                upsert_symbols(conn, symbol_pairs)
-                print(f"Symbol pool refreshed from Tushare: {len(symbol_pairs)}")
-            except Exception as exc:
+            local_pairs = get_symbol_pool_from_local_cache(conn)
+            if args.skip_symbol_refresh:
                 if not local_pairs:
                     raise RuntimeError(
-                        f"无法从 Tushare 获取股票池，且本地无缓存。错误: {exc}"
-                    ) from exc
+                        "指定了 --skip-symbol-refresh，但本地无股票池缓存。"
+                    )
                 symbol_pairs = local_pairs
-                print(
-                    f"Tushare 股票池获取失败，已使用本地缓存 {len(symbol_pairs)}。错误: {exc}",
-                    file=sys.stderr,
-                )
+                print(f"Using local symbol cache: {len(symbol_pairs)}")
+            else:
+                try:
+                    symbol_pairs = get_symbol_pool_from_ts(pro)
+                    upsert_symbols(conn, symbol_pairs)
+                    print(f"Symbol pool refreshed from Tushare: {len(symbol_pairs)}")
+                except Exception as exc:
+                    if not local_pairs:
+                        raise RuntimeError(
+                            f"无法从 Tushare 获取股票池，且本地无缓存。错误: {exc}"
+                        ) from exc
+                    symbol_pairs = local_pairs
+                    print(
+                        f"Tushare 股票池获取失败，已使用本地缓存 {len(symbol_pairs)}。错误: {exc}",
+                        file=sys.stderr,
+                    )
 
     # 步骤 7：应用数量限制并输出运行摘要。
     if args.limit and args.limit > 0:
@@ -600,6 +701,7 @@ def main() -> int:
     print(f"Symbols to sync: {total_symbols}")
     print(f"Date range: {start_date} -> {end_date}")
     print(f"Adjust: {ADJUST_MODE or '(none)'}")
+    print(f"Trading-day pre-check: {trading_day_check_source}")
     if ADJUST_MODE:
         if is_weekly_full_day:
             print(
@@ -635,7 +737,7 @@ def main() -> int:
             print(f"[{idx}/{total_symbols}] {symbol}: up-to-date, skip")
             continue
 
-        if not has_potential_trading_day(local_start, end_date):
+        if not has_trading_day(local_start, end_date):
             skipped += 1
             print(f"[{idx}/{total_symbols}] {symbol}: no potential trading day in range, skip")
             continue
@@ -678,7 +780,14 @@ def main() -> int:
     if args.save_failed_file and failed_symbols:
         out = Path(args.save_failed_file).expanduser().resolve()
         write_failed_symbols(out, failed_symbols)
-        print(f"Failed symbols saved: {out} ({len(set(failed_symbols))})")
+        saved_count = len(
+            {
+                normalize_symbol(s)
+                for s in failed_symbols
+                if len(normalize_symbol(s)) == 6
+            }
+        )
+        print(f"Failed symbols saved: {out} ({saved_count})")
 
     conn.close()
     return 0 if failed == 0 else 2

@@ -14,6 +14,7 @@
 - 增量同步，重复执行不会产生重复数据。
 - 复权模式下支持回补窗口，降低历史复权值过期风险。
 - 股票池刷新失败时自动回退本地缓存，提高任务稳健性。
+- 每次运行会先构建交易日预检查（优先 `trade_cal`，不可用时回退工作日规则），可跳过明显无交易日区间的逐股请求。
 - Token 支持 CLI / 环境变量 / 文件三种来源。
 
 ## Project Structure
@@ -65,7 +66,10 @@ A 股日线主表，主键为 `(symbol, trade_date)`。
    日常运行按增量更新，默认日常回补天数为 `0`（纯增量）。
 
 2. Weekly full refresh  
-   当脚本内 `ADJUST_MODE` 为复权模式（`qfq/hfq`）时，到每周触发日（默认周日）CLI 询问是否执行近似全量回补；确认后使用回补天数 `99999`。
+   当脚本内 `ADJUST_MODE` 为复权模式（`qfq/hfq`）时，到每周触发日（默认周日）可通过 `--weekly-full` 控制：
+   - `auto`：保持当前交互确认（默认）
+   - `yes`：触发日自动执行近似全量回补
+   - `no`：永不执行每周全量
 
 3. Symbol universe refresh  
    默认先从 Tushare 刷新股票池，失败时回退本地缓存。
@@ -118,11 +122,21 @@ python /Users/zhao/Quant/股票数据/sync_a_share_to_sqlite.py \
   --skip-symbol-refresh
 ```
 
+只重跑失败股票（失败列表优先级最高）：
+```bash
+python /Users/zhao/Quant/股票数据/sync_a_share_to_sqlite.py \
+  --retry-failed-file data/failed_symbols.txt \
+  --save-failed-file data/failed_symbols_next.txt
+```
+
 ## Key Arguments
 - `--db`：SQLite 文件路径。
 - `--start-date` / `--end-date`：同步区间。
 - `--symbols` / `--symbols-file`：手动指定股票池。
 - `--skip-symbol-refresh`：只用本地股票池缓存。
+- `--weekly-full {auto,yes,no}`：每周全量触发日的执行策略（默认 `auto`）。
+- `--retry-failed-file`：从失败列表文件读取股票代码并仅同步这些代码（高于 `--symbols/--symbols-file` 与股票池刷新）。
+- `--save-failed-file`：当本次存在失败股票时，将失败代码去重后写入文件（每行一个 6 位代码）。
 - `--ts-token`：临时覆盖 Tushare token。
 
 ## Log Format
