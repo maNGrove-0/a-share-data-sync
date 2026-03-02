@@ -465,6 +465,35 @@ def ask_weekly_full_refresh(today: dt.date) -> bool:
     return answer in {"y", "yes", "1", "true", "是"}
 
 
+def decide_weekly_full_refresh(today: dt.date, mode: str) -> bool:
+    """根据运行模式决定周触发日是否执行全量回补。"""
+    if today.weekday() != WEEKLY_FULL_WEEKDAY:
+        return False
+    mode = (mode or "auto").strip().lower()
+    if mode == "yes":
+        return True
+    if mode == "no":
+        return False
+    return ask_weekly_full_refresh(today)
+
+
+def has_potential_trading_day(start_date: dt.date, end_date: dt.date) -> bool:
+    """轻量交易日判断：区间内存在工作日才认为有潜在交易日。"""
+    d = start_date
+    while d <= end_date:
+        if d.weekday() < 5:
+            return True
+        d += dt.timedelta(days=1)
+    return False
+
+
+def write_failed_symbols(file_path: Path, symbols: list[str]) -> None:
+    """将失败股票代码落盘（每行一个 6 位代码）。"""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    unique_codes = sorted({normalize_symbol(s) for s in symbols if len(normalize_symbol(s)) == 6})
+    file_path.write_text("\n".join(unique_codes) + ("\n" if unique_codes else ""), encoding="utf-8")
+
+
 def build_cli() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(description="Sync A-share daily data from Tushare.")
@@ -503,7 +532,7 @@ def main() -> int:
     # 步骤 3：计算运行模式（每日增量 / 每周触发日询问全量）。
     today = dt.date.today()
     # 仅复权模式(qfq/hfq)才需要回补；不复权模式下跳过每周全量询问。
-    is_weekly_full_day = bool(ADJUST_MODE) and ask_weekly_full_refresh(today)
+    is_weekly_full_day = bool(ADJUST_MODE) and decide_weekly_full_refresh(today, args.weekly_full)
     effective_backfill_days = (
         WEEKLY_FULL_BACKFILL_DAYS if is_weekly_full_day else DAILY_ADJUST_BACKFILL_DAYS
     )
@@ -519,7 +548,22 @@ def main() -> int:
 
     # 步骤 6：确定股票池（手动指定 / 远端刷新 / 本地缓存回退）。
     manual_symbols = parse_symbols_args(args)
-    if manual_symbols:
+    failed_retry_symbols = []
+    if args.retry_failed_file:
+        retry_path = Path(args.retry_failed_file)
+        if not retry_path.exists():
+            raise FileNotFoundError(f"retry-failed file not found: {retry_path}")
+        text = retry_path.read_text(encoding="utf-8")
+        for s in text.replace("\n", ",").split(","):
+            code = normalize_symbol(s)
+            if len(code) == 6:
+                failed_retry_symbols.append(code)
+        failed_retry_symbols = sorted(set(failed_retry_symbols))
+
+    if failed_retry_symbols:
+        symbol_pairs = [(s, "") for s in failed_retry_symbols]
+        print(f"Using retry-failed symbol list: {len(symbol_pairs)}")
+    elif manual_symbols:
         symbol_pairs = [(s, "") for s in manual_symbols]
     else:
         local_pairs = get_symbol_pool_from_local_cache(conn)
@@ -570,7 +614,9 @@ def main() -> int:
 
     inserted_total = 0
     skipped = 0
+    empty_return = 0
     failed = 0
+    failed_symbols: list[str] = []
 
     # 步骤 8：逐只股票执行“起始日计算 -> 拉取 -> 标准化 -> 入库”。
     for idx, (symbol, _) in enumerate(symbol_pairs, start=1):
@@ -589,6 +635,11 @@ def main() -> int:
             print(f"[{idx}/{total_symbols}] {symbol}: up-to-date, skip")
             continue
 
+        if not has_potential_trading_day(local_start, end_date):
+            skipped += 1
+            print(f"[{idx}/{total_symbols}] {symbol}: no potential trading day in range, skip")
+            continue
+
         try:
             # 8.3 拉取并标准化数据，再 UPSERT 入库。
             raw_df = fetch_symbol_daily_ts(
@@ -603,9 +654,12 @@ def main() -> int:
             norm_df = normalize_daily_df_ts(raw_df, symbol=symbol)
             rows = upsert_daily_quotes(conn, norm_df)
             inserted_total += rows
+            if rows == 0:
+                empty_return += 1
             print(f"[{idx}/{total_symbols}] {symbol}: {local_start} -> {end_date}, rows={rows}")
         except Exception as exc:
             failed += 1
+            failed_symbols.append(symbol)
             print(f"[{idx}/{total_symbols}] {symbol}: FAILED: {exc}", file=sys.stderr)
 
         if REQUEST_SLEEP_SECONDS > 0:
@@ -613,8 +667,19 @@ def main() -> int:
 
     # 步骤 9：输出汇总并返回进程码。
     print(
-        f"Done. inserted_rows={inserted_total}, skipped={skipped}, failed={failed}, symbols={total_symbols}"
+        "Done. "
+        f"inserted_rows={inserted_total}, "
+        f"skipped={skipped}, "
+        f"empty_return={empty_return}, "
+        f"failed={failed}, "
+        f"symbols={total_symbols}"
     )
+
+    if args.save_failed_file and failed_symbols:
+        out = Path(args.save_failed_file).expanduser().resolve()
+        write_failed_symbols(out, failed_symbols)
+        print(f"Failed symbols saved: {out} ({len(set(failed_symbols))})")
+
     conn.close()
     return 0 if failed == 0 else 2
 
