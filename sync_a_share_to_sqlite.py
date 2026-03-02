@@ -659,9 +659,14 @@ def main() -> int:
                 failed_retry_symbols.append(code)
         failed_retry_symbols = sorted(set(failed_retry_symbols))
 
-    if failed_retry_symbols:
+    if args.retry_failed_file:
         symbol_pairs = [(s, "") for s in failed_retry_symbols]
-        print(f"Using retry-failed symbol list: {len(symbol_pairs)}")
+        if symbol_pairs:
+            print(f"Using retry-failed symbol list: {len(symbol_pairs)}")
+        else:
+            print(
+                f"Retry-failed file provided but yielded 0 valid symbols: {Path(args.retry_failed_file).expanduser().resolve()}"
+            )
     else:
         manual_symbols = parse_symbols_args(args)
         if manual_symbols:
