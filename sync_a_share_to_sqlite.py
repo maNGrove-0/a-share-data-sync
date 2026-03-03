@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import datetime as dt
+import hashlib
 import json
 import os
 import random
@@ -574,6 +575,29 @@ def write_failed_symbols(file_path: Path, symbols: list[str]) -> None:
     file_path.write_text("\n".join(unique_codes) + ("\n" if unique_codes else ""), encoding="utf-8")
 
 
+def build_symbol_identity(symbol_pairs: list[tuple[str, str]]) -> dict[str, str | int]:
+    """生成股票池身份摘要，用于校验 checkpoint 是否可安全续跑。"""
+    symbols = [s for s, _ in symbol_pairs]
+    joined = "\n".join(symbols)
+    return {
+        "symbol_hash": hashlib.sha256(joined.encode("utf-8")).hexdigest(),
+        "symbol_count": len(symbols),
+        "symbol_first": symbols[0] if symbols else "",
+        "symbol_last": symbols[-1] if symbols else "",
+    }
+
+
+def parse_next_index_safely(value: object) -> int | None:
+    """安全解析 checkpoint 里的 next_index。"""
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
 def load_checkpoint(file_path: Path) -> dict | None:
     """读取 checkpoint 文件。不存在或损坏时返回 None。"""
     if not file_path.exists():
@@ -593,6 +617,7 @@ def save_checkpoint(
     next_index: int,
     total_symbols: int,
     last_symbol: str,
+    symbol_identity: dict[str, str | int],
 ) -> None:
     """保存 checkpoint，记录下次应从第几个 symbol 开始。"""
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -605,6 +630,7 @@ def save_checkpoint(
         "next_index": next_index,
         "total_symbols": total_symbols,
         "last_symbol": last_symbol,
+        **symbol_identity,
     }
     file_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -619,6 +645,34 @@ def clear_checkpoint(file_path: Path) -> None:
             file_path.unlink()
     except Exception:
         pass
+
+
+def checkpoint_symbol_identity_matches(
+    checkpoint: dict,
+    current_identity: dict[str, str | int],
+) -> bool:
+    """校验 checkpoint 的股票池身份是否与当前运行一致。"""
+    ck_hash = str(checkpoint.get("symbol_hash", "")).strip()
+    ck_count = checkpoint.get("symbol_count")
+    ck_first = str(checkpoint.get("symbol_first", "")).strip()
+    ck_last = str(checkpoint.get("symbol_last", "")).strip()
+
+    has_identity = any([ck_hash, ck_count is not None, ck_first, ck_last])
+    if not has_identity:
+        # 兼容历史 checkpoint（无 symbol identity 字段）。
+        return True
+
+    try:
+        ck_count_int = int(ck_count)
+    except (TypeError, ValueError):
+        return False
+
+    return (
+        ck_hash == current_identity["symbol_hash"]
+        and ck_count_int == current_identity["symbol_count"]
+        and ck_first == current_identity["symbol_first"]
+        and ck_last == current_identity["symbol_last"]
+    )
 
 
 def is_tushare_daily_quota_error(exc: Exception) -> bool:
@@ -765,6 +819,7 @@ def main() -> int:
         symbol_pairs = symbol_pairs[: args.limit]
 
     total_symbols = len(symbol_pairs)
+    symbol_identity = build_symbol_identity(symbol_pairs)
     print(f"DB: {db_path}")
     print("Source: tushare")
     print(f"Symbols to sync: {total_symbols}")
@@ -798,14 +853,34 @@ def main() -> int:
             ck_db = str(checkpoint.get("db", "")).strip()
             ck_start = str(checkpoint.get("start_date", "")).strip()
             ck_end = str(checkpoint.get("end_date", "")).strip()
-            ck_next = int(checkpoint.get("next_index", 1) or 1)
-            if ck_db == str(db_path) and ck_start == start_date.isoformat() and ck_end == end_date.isoformat():
-                start_index = max(1, min(ck_next, total_symbols + 1))
-                if start_index > 1:
+            ck_next = parse_next_index_safely(checkpoint.get("next_index"))
+            context_match = (
+                ck_db == str(db_path)
+                and ck_start == start_date.isoformat()
+                and ck_end == end_date.isoformat()
+            )
+            identity_match = checkpoint_symbol_identity_matches(checkpoint, symbol_identity)
+            if context_match and identity_match:
+                if ck_next is None:
                     print(
-                        f"Resume from checkpoint: next_index={start_index}/{total_symbols} "
-                        f"(file={checkpoint_path})"
+                        "Checkpoint exists but next_index is invalid; ignore resume. "
+                        f"file={checkpoint_path}",
+                        file=sys.stderr,
                     )
+                elif ck_next > total_symbols:
+                    clear_checkpoint(checkpoint_path)
+                    print(
+                        "Checkpoint next_index exceeds current symbol count; "
+                        f"cleared stale checkpoint and restart from beginning. file={checkpoint_path}",
+                        file=sys.stderr,
+                    )
+                else:
+                    start_index = max(1, ck_next)
+                    if start_index > 1:
+                        print(
+                            f"Resume from checkpoint: next_index={start_index}/{total_symbols} "
+                            f"(file={checkpoint_path})"
+                        )
             else:
                 print(
                     "Checkpoint exists but does not match current run context; ignore resume. "
@@ -838,6 +913,7 @@ def main() -> int:
                 next_index=idx + 1,
                 total_symbols=total_symbols,
                 last_symbol=symbol,
+                symbol_identity=symbol_identity,
             )
             continue
 
@@ -852,6 +928,7 @@ def main() -> int:
                 next_index=idx + 1,
                 total_symbols=total_symbols,
                 last_symbol=symbol,
+                symbol_identity=symbol_identity,
             )
             continue
 
@@ -880,6 +957,7 @@ def main() -> int:
                 next_index=idx + 1,
                 total_symbols=total_symbols,
                 last_symbol=symbol,
+                symbol_identity=symbol_identity,
             )
         except Exception as exc:
             failed += 1
@@ -897,6 +975,7 @@ def main() -> int:
                     next_index=idx,
                     total_symbols=total_symbols,
                     last_symbol=symbol,
+                    symbol_identity=symbol_identity,
                 )
                 # 将剩余未执行 symbol 合并进失败列表，便于次日快速重跑。
                 remaining_symbols = [s for s, _ in symbol_pairs[idx - 1 :]]
@@ -916,6 +995,7 @@ def main() -> int:
                 next_index=idx + 1,
                 total_symbols=total_symbols,
                 last_symbol=symbol,
+                symbol_identity=symbol_identity,
             )
 
         if REQUEST_SLEEP_SECONDS > 0:
