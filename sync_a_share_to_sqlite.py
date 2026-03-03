@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import datetime as dt
+import json
 import os
 import random
 import sqlite3
@@ -573,6 +574,59 @@ def write_failed_symbols(file_path: Path, symbols: list[str]) -> None:
     file_path.write_text("\n".join(unique_codes) + ("\n" if unique_codes else ""), encoding="utf-8")
 
 
+def load_checkpoint(file_path: Path) -> dict | None:
+    """读取 checkpoint 文件。不存在或损坏时返回 None。"""
+    if not file_path.exists():
+        return None
+    try:
+        return json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_checkpoint(
+    file_path: Path,
+    *,
+    db_path: Path,
+    start_date: dt.date,
+    end_date: dt.date,
+    next_index: int,
+    total_symbols: int,
+    last_symbol: str,
+) -> None:
+    """保存 checkpoint，记录下次应从第几个 symbol 开始。"""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "updated_at": now_ts(),
+        "db": str(db_path),
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "next_index": next_index,
+        "total_symbols": total_symbols,
+        "last_symbol": last_symbol,
+    }
+    file_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def clear_checkpoint(file_path: Path) -> None:
+    """清理 checkpoint 文件（任务跑完整后调用）。"""
+    try:
+        if file_path.exists():
+            file_path.unlink()
+    except Exception:
+        pass
+
+
+def is_tushare_daily_quota_error(exc: Exception) -> bool:
+    """判断是否命中 Tushare 日调用限额。"""
+    msg = str(exc)
+    return "最多访问该接口10000次" in msg or "每天最多访问该接口10000次" in msg
+
+
 def build_cli() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(description="Sync A-share daily data from Tushare.")
@@ -606,6 +660,16 @@ def build_cli() -> argparse.ArgumentParser:
         "--retry-failed-file",
         default="",
         help="从失败列表文件读取股票代码并仅同步这些代码（优先级最高）",
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        default="data/sync_checkpoint.json",
+        help="checkpoint 文件路径；用于断点续跑",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        action="store_true",
+        help="从 checkpoint 指定进度继续执行",
     )
     parser.add_argument("--ts-token", default="", help="Priority: cli > env > fixed file")
     return parser
@@ -724,9 +788,35 @@ def main() -> int:
     empty_return = 0
     failed = 0
     failed_symbols: list[str] = []
+    quota_hit = False
+
+    checkpoint_path = Path(args.checkpoint_file).expanduser().resolve()
+    start_index = 1
+    if args.resume_from_checkpoint:
+        checkpoint = load_checkpoint(checkpoint_path)
+        if checkpoint:
+            ck_db = str(checkpoint.get("db", "")).strip()
+            ck_start = str(checkpoint.get("start_date", "")).strip()
+            ck_end = str(checkpoint.get("end_date", "")).strip()
+            ck_next = int(checkpoint.get("next_index", 1) or 1)
+            if ck_db == str(db_path) and ck_start == start_date.isoformat() and ck_end == end_date.isoformat():
+                start_index = max(1, min(ck_next, total_symbols + 1))
+                if start_index > 1:
+                    print(
+                        f"Resume from checkpoint: next_index={start_index}/{total_symbols} "
+                        f"(file={checkpoint_path})"
+                    )
+            else:
+                print(
+                    "Checkpoint exists but does not match current run context; ignore resume. "
+                    f"file={checkpoint_path}",
+                    file=sys.stderr,
+                )
 
     # 步骤 8：逐只股票执行“起始日计算 -> 拉取 -> 标准化 -> 入库”。
-    for idx, (symbol, _) in enumerate(symbol_pairs, start=1):
+    for idx in range(start_index, total_symbols + 1):
+        symbol, _ = symbol_pairs[idx - 1]
+
         # 8.1 根据本地最后交易日与回补策略，计算本次拉取起点。
         last_dt = get_last_trade_date(conn, symbol)
         local_start = compute_fetch_start_date(
@@ -740,11 +830,29 @@ def main() -> int:
         if local_start > end_date:
             skipped += 1
             print(f"[{idx}/{total_symbols}] {symbol}: up-to-date, skip")
+            save_checkpoint(
+                checkpoint_path,
+                db_path=db_path,
+                start_date=start_date,
+                end_date=end_date,
+                next_index=idx + 1,
+                total_symbols=total_symbols,
+                last_symbol=symbol,
+            )
             continue
 
         if not has_trading_day(local_start, end_date):
             skipped += 1
             print(f"[{idx}/{total_symbols}] {symbol}: no potential trading day in range, skip")
+            save_checkpoint(
+                checkpoint_path,
+                db_path=db_path,
+                start_date=start_date,
+                end_date=end_date,
+                next_index=idx + 1,
+                total_symbols=total_symbols,
+                last_symbol=symbol,
+            )
             continue
 
         try:
@@ -764,10 +872,51 @@ def main() -> int:
             if rows == 0:
                 empty_return += 1
             print(f"[{idx}/{total_symbols}] {symbol}: {local_start} -> {end_date}, rows={rows}")
+            save_checkpoint(
+                checkpoint_path,
+                db_path=db_path,
+                start_date=start_date,
+                end_date=end_date,
+                next_index=idx + 1,
+                total_symbols=total_symbols,
+                last_symbol=symbol,
+            )
         except Exception as exc:
             failed += 1
             failed_symbols.append(symbol)
             print(f"[{idx}/{total_symbols}] {symbol}: FAILED: {exc}", file=sys.stderr)
+
+            if is_tushare_daily_quota_error(exc):
+                quota_hit = True
+                # 配额命中时，保留当前 symbol 作为下次起点。
+                save_checkpoint(
+                    checkpoint_path,
+                    db_path=db_path,
+                    start_date=start_date,
+                    end_date=end_date,
+                    next_index=idx,
+                    total_symbols=total_symbols,
+                    last_symbol=symbol,
+                )
+                # 将剩余未执行 symbol 合并进失败列表，便于次日快速重跑。
+                remaining_symbols = [s for s, _ in symbol_pairs[idx - 1 :]]
+                failed_symbols.extend(remaining_symbols)
+                print(
+                    f"Tushare daily quota hit, stop early at {idx}/{total_symbols}. "
+                    "Use --resume-from-checkpoint or --retry-failed-file next run.",
+                    file=sys.stderr,
+                )
+                break
+
+            save_checkpoint(
+                checkpoint_path,
+                db_path=db_path,
+                start_date=start_date,
+                end_date=end_date,
+                next_index=idx + 1,
+                total_symbols=total_symbols,
+                last_symbol=symbol,
+            )
 
         if REQUEST_SLEEP_SECONDS > 0:
             time.sleep(REQUEST_SLEEP_SECONDS)
@@ -779,6 +928,7 @@ def main() -> int:
         f"skipped={skipped}, "
         f"empty_return={empty_return}, "
         f"failed={failed}, "
+        f"quota_hit={quota_hit}, "
         f"symbols={total_symbols}"
     )
 
@@ -793,6 +943,10 @@ def main() -> int:
             }
         )
         print(f"Failed symbols saved: {out} ({saved_count})")
+
+    finished_all = not quota_hit and start_index <= total_symbols
+    if finished_all:
+        clear_checkpoint(checkpoint_path)
 
     conn.close()
     return 0 if failed == 0 else 2
