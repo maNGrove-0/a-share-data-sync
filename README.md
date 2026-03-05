@@ -21,6 +21,9 @@
 ```text
 .
 ├── sync_a_share_to_sqlite.py   # 主脚本
+├── screen_stocks.py            # 多条件规则选股脚本
+├── examples/
+│   └── screener_rules.sample.json
 ├── data/
 │   ├── a_share.db              # 本地数据库（运行后生成）
 │   └── ts_token.txt            # Tushare token（建议本地文件）
@@ -128,6 +131,54 @@ python /Users/zhao/Quant/股票数据/sync_a_share_to_sqlite.py \
   --retry-failed-file data/failed_symbols.txt \
   --save-failed-file data/failed_symbols_next.txt
 ```
+
+## Stock Screener
+`screen_stocks.py` 可直接在本地 `daily_quotes` 上做规则选股，支持多条件 `AND/OR` 嵌套。
+
+### Quick Usage
+使用示例规则文件（默认筛选最新交易日）：
+```bash
+python screen_stocks.py \
+  --db data/a_share.db \
+  --rules-file examples/screener_rules.sample.json \
+  --limit 30
+```
+
+指定交易日并输出 JSON：
+```bash
+python screen_stocks.py \
+  --db data/a_share.db \
+  --rules-file examples/screener_rules.sample.json \
+  --trade-date 2026-03-04 \
+  --output json
+```
+
+### Rule JSON Format
+逻辑节点：
+```json
+{
+  "logic": "and",
+  "rules": [
+    {"field": "close", "op": ">", "value": 10},
+    {
+      "logic": "or",
+      "rules": [
+        {"field": "pct_chg", "op": ">=", "value": 2},
+        {"field": "amount", "op": ">", "value": 500000000}
+      ]
+    }
+  ]
+}
+```
+
+支持运算符：
+- 比较：`>`, `>=`, `<`, `<=`, `=`, `!=`
+- 集合：`in`, `not in`
+- 区间：`between`
+- 空值：`is null`, `is not null`
+
+可用字段：
+`symbol`, `name`, `trade_date`, `open`, `high`, `low`, `close`, `volume`, `amount`, `amplitude`, `pct_chg`, `chg`, `turnover`, `source`
 
 ## Key Arguments
 - `--db`：SQLite 文件路径。
