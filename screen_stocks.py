@@ -123,6 +123,12 @@ def build_leaf_rule_sql(
     if operator in ("IS NULL", "IS NOT NULL"):
         return "{0} {1}".format(column, operator), []
 
+    if operator in (">", ">=", "<", "<=", "=", "!="):
+        if "value" not in rule or rule.get("value") is None:
+            raise RuleValidationError(
+                "operator {0} requires non-null value".format(operator)
+            )
+
     value = rule.get("value")
     if operator in ("IN", "NOT IN"):
         if not isinstance(value, (list, tuple)) or len(value) == 0:

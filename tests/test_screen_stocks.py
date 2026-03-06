@@ -38,6 +38,20 @@ class BuildRuleSqlTests(unittest.TestCase):
         with self.assertRaises(RuleValidationError):
             build_rule_sql(rule, FIELD_SQL_MAP)
 
+    def test_comparison_operator_requires_value(self) -> None:
+        for op in (">", ">=", "<", "<=", "=", "!="):
+            with self.subTest(op=op):
+                with self.assertRaises(RuleValidationError):
+                    build_rule_sql({"field": "close", "op": op}, FIELD_SQL_MAP)
+
+    def test_comparison_operator_rejects_none_value(self) -> None:
+        for op in (">", ">=", "<", "<=", "=", "!="):
+            with self.subTest(op=op):
+                with self.assertRaises(RuleValidationError):
+                    build_rule_sql(
+                        {"field": "close", "op": op, "value": None}, FIELD_SQL_MAP
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
