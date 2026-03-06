@@ -1,0 +1,30 @@
+{
+  "logic": "and",
+  "rules": [
+    {
+      "field": "close",
+      "op": ">",
+      "value": 10
+    },
+    {
+      "field": "pct_chg",
+      "op": ">=",
+      "value": 2
+    },
+    {
+      "logic": "or",
+      "rules": [
+        {
+          "field": "amount",
+          "op": ">",
+          "value": 500000000
+        },
+        {
+          "field": "volume",
+          "op": ">",
+          "value": 800000
+        }
+      ]
+    }
+  ]
+}
